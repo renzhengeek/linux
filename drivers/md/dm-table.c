@@ -1830,6 +1830,9 @@ static bool dm_table_supports_discards(struct dm_table *t)
 		if (!ti->num_discard_bios)
 			return false;
 
+		if (ti->discards_unsupported)
+			return false;
+
 		/*
 		 * Either the target provides discard support (as implied by setting
 		 * 'discards_supported') or it relies on _all_ data devices having
