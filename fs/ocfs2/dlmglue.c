@@ -351,6 +351,14 @@ static inline void ocfs2_cluster_unlock(struct ocfs2_super *osb,
 					struct ocfs2_lock_res *lockres,
 					int level)
 {
+	struct ocfs2_holder *oh = ocfs2_is_locked_by_me(lockres);
+
+	if (unlikely(!oh))
+		mlog_bug_on_msg(1, "PID(%d) unlock lockres(%s) unnecessarily\n",
+				pid_nr(oh->oh_owner_pid), lockres->l_name);
+	else
+		ocfs2_remove_holder(lockres, oh);
+
 	__ocfs2_cluster_unlock(osb, lockres, level, _RET_IP_);
 }
 
@@ -532,6 +540,7 @@ void ocfs2_lock_res_init_once(struct ocfs2_lock_res *res)
 	init_waitqueue_head(&res->l_event);
 	INIT_LIST_HEAD(&res->l_blocked_list);
 	INIT_LIST_HEAD(&res->l_mask_waiters);
+	INIT_LIST_HEAD(&res->l_holders);
 }
 
 void ocfs2_inode_lock_res_init(struct ocfs2_lock_res *res,
@@ -747,6 +756,52 @@ void ocfs2_lock_res_free(struct ocfs2_lock_res *res)
 	memset(&res->l_lksb, 0, sizeof(res->l_lksb));
 
 	res->l_flags = 0UL;
+}
+
+static inline void ocfs2_add_holder(struct ocfs2_lock_res *lockres)
+{
+	unsigned long flags;
+	struct ocfs2_holder *oh = kmalloc(sizeof(ocfs2_holder), GFP_KERNEL);
+
+	INIT_LIST_HEAD(&oh->oh_list);
+	oh->oh_lockres = lockres;
+	oh->oh_owner_pid =  get_pid(task_pid(current));
+
+	spin_lock_irqsave(&lockres->l_lock, flags);
+	list_add_tail(&oh->oh_list, &lockres->l_holders);
+	spin_unlock_irqsave(&lockres->l_lock, flags);
+}
+
+static inline void ocfs2_remove_holder(struct ocfs2_lock_res *lockres,
+				       struct ocfs2_holder *oh)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&lockres->l_lock, flags);
+	list_del(&oh->oh_list);
+	spin_unlock_irqsave(&lockres->l_lock, flags);
+
+	put_pid(oh->oh_owner_pid);
+	kfree(oh);
+}
+
+struct ocfs2_holder *ocfs2_is_locked_by_me(struct ocfs2_lock_res *lockres)
+{
+	unsigned long flags;
+	struct ocfs2_holder *oh;
+	struct pid *pid;
+
+	spin_lock_irqsave(&lockres->l_lock, flags);
+	pid = task_pid(current);
+	list_for_each_entry(oh, &lockres->l_holders, oh_list) {
+		if (oh->oh_owner_pid == pid)
+			goto out;
+	}
+	oh = NULL;
+out:
+	spin_unlock_irqsave(&lockres->l_lock, flags);
+
+	return oh;
 }
 
 static inline void ocfs2_inc_holders(struct ocfs2_lock_res *lockres,
@@ -1585,6 +1640,14 @@ static inline int ocfs2_cluster_lock(struct ocfs2_super *osb,
 				     u32 lkm_flags,
 				     int arg_flags)
 {
+	struct ocfs2_holder *oh = ocfs2_is_locked_by_me(lockres);
+
+	if (unlikely(oh))
+		mlog_bug_on_msg(1, "PID(%d) locks on lockres(%s) recursively\n",
+				pid_nr(oh->oh_owner_pid), lockres->l_name);
+	else
+		ocfs2_add_holder(lockres);
+
 	return __ocfs2_cluster_lock(osb, lockres, level, lkm_flags, arg_flags,
 				    0, _RET_IP_);
 }
