@@ -70,6 +70,13 @@ struct ocfs2_orphan_scan_lvb {
 	__be32	lvb_os_seqno;
 };
 
+struct ocfs2_holder {
+	struct list_head oh_list;
+
+	struct ocfs2_lock_res *oh_lockres;
+	struct pid *oh_owner_pid;
+};
+
 /* ocfs2_inode_lock_full() 'arg_flags' flags */
 /* don't wait on recovery. */
 #define OCFS2_META_LOCK_RECOVERY	(0x01)
@@ -170,4 +177,10 @@ void ocfs2_put_dlm_debug(struct ocfs2_dlm_debug *dlm_debug);
 
 /* To set the locking protocol on module initialization */
 void ocfs2_set_locking_protocol(void);
+
+/*
+ * Keep a list of processes that have interest in a lockres.
+ * Note: this is now only uesed for check recursive cluster lock.
+ */
+struct ocfs2_holder *ocfs2_is_locked_by_me(struct ocfs2_lock_res *lockres);
 #endif	/* DLMGLUE_H */

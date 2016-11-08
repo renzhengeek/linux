@@ -532,6 +532,7 @@ void ocfs2_lock_res_init_once(struct ocfs2_lock_res *res)
 	init_waitqueue_head(&res->l_event);
 	INIT_LIST_HEAD(&res->l_blocked_list);
 	INIT_LIST_HEAD(&res->l_mask_waiters);
+	INIT_LIST_HEAD(&res->l_holders);
 }
 
 void ocfs2_inode_lock_res_init(struct ocfs2_lock_res *res,
@@ -747,6 +748,56 @@ void ocfs2_lock_res_free(struct ocfs2_lock_res *res)
 	memset(&res->l_lksb, 0, sizeof(res->l_lksb));
 
 	res->l_flags = 0UL;
+}
+
+static inline int ocfs2_add_holder(struct ocfs2_lock_res *lockres)
+{
+	struct ocfs2_holder *oh;
+
+	oh = kmalloc(sizeof(struct ocfs2_holder), GFP_KERNEL);
+	if (!oh) {
+		mlog_errno(-ENOMEM);
+		return -ENOMEM;
+	}
+
+	INIT_LIST_HEAD(&oh->oh_list);
+	oh->oh_lockres = lockres;
+	oh->oh_owner_pid =  get_pid(task_pid(current));
+
+	spin_lock(&lockres->l_lock);
+	list_add_tail(&oh->oh_list, &lockres->l_holders);
+	spin_unlock(&lockres->l_lock);
+
+	return 0;
+}
+
+static inline void ocfs2_remove_holder(struct ocfs2_lock_res *lockres,
+				       struct ocfs2_holder *oh)
+{
+	spin_lock(&lockres->l_lock);
+	list_del(&oh->oh_list);
+	spin_unlock(&lockres->l_lock);
+
+	put_pid(oh->oh_owner_pid);
+	kfree(oh);
+}
+
+struct ocfs2_holder *ocfs2_is_locked_by_me(struct ocfs2_lock_res *lockres)
+{
+	struct ocfs2_holder *oh;
+	struct pid *pid;
+
+	spin_lock(&lockres->l_lock);
+	pid = task_pid(current);
+	list_for_each_entry(oh, &lockres->l_holders, oh_list) {
+		if (oh->oh_owner_pid == pid)
+			goto out;
+	}
+	oh = NULL;
+out:
+	spin_unlock(&lockres->l_lock);
+
+	return oh;
 }
 
 static inline void ocfs2_inc_holders(struct ocfs2_lock_res *lockres,
@@ -2318,6 +2369,7 @@ int ocfs2_inode_lock_full_nested(struct inode *inode,
 	struct ocfs2_lock_res *lockres = NULL;
 	struct ocfs2_super *osb = OCFS2_SB(inode->i_sb);
 	struct buffer_head *local_bh = NULL;
+	struct ocfs2_holder *oh;
 
 	mlog(0, "inode %llu, take %s META lock\n",
 	     (unsigned long long)OCFS2_I(inode)->ip_blkno,
@@ -2344,6 +2396,25 @@ int ocfs2_inode_lock_full_nested(struct inode *inode,
 	dlm_flags = 0;
 	if (arg_flags & OCFS2_META_LOCK_NOQUEUE)
 		dlm_flags |= DLM_LKF_NOQUEUE;
+	/*
+	 * Recursive cluster locking is NOT allowed; basically we can avoid
+	 * that by coding carefully. However, there are VFS operations like
+	 * inode_permission(), get/set_acl() and get/setattr() that need
+	 * cluster filesystem wrap around their specific callbacks with cluster
+	 * lock respectively, such as ocfs2_permission():
+	 * 	ocfs2_inode_lock()
+	 * 	generic_permission()
+	 * 	ocfs2_inode_unlock()
+	 * and these VFS ops may call into each other. Thus cluster deadlock
+	 * may occur because of recursive cluster locking. So we skip cluster
+	 * locking here if we already take it.
+	 */
+	oh = ocfs2_is_locked_by_me(lockres);
+	if (unlikely(oh)) {
+		mlog(ML_ERROR, "PID(%d) locks on lockres(%s) recursively\n",
+		     pid_nr(oh->oh_owner_pid), lockres->l_name);
+		goto getbh;
+	}
 
 	status = __ocfs2_cluster_lock(osb, lockres, level, dlm_flags,
 				      arg_flags, subclass, _RET_IP_);
@@ -2355,6 +2426,11 @@ int ocfs2_inode_lock_full_nested(struct inode *inode,
 
 	/* Notify the error cleanup path to drop the cluster lock. */
 	acquired = 1;
+
+	/* Add ourself as holder onto this lockres */
+	status = ocfs2_add_holder(lockres);
+	if (status < 0)
+		goto bail;
 
 	/* We wait twice because a node may have died while we were in
 	 * the lower dlm layers. The second time though, we've
@@ -2487,14 +2563,24 @@ void ocfs2_inode_unlock(struct inode *inode,
 	int level = ex ? DLM_LOCK_EX : DLM_LOCK_PR;
 	struct ocfs2_lock_res *lockres = &OCFS2_I(inode)->ip_inode_lockres;
 	struct ocfs2_super *osb = OCFS2_SB(inode->i_sb);
+	struct ocfs2_holder *oh;
 
 	mlog(0, "inode %llu drop %s META lock\n",
 	     (unsigned long long)OCFS2_I(inode)->ip_blkno,
 	     ex ? "EXMODE" : "PRMODE");
 
 	if (!ocfs2_is_hard_readonly(OCFS2_SB(inode->i_sb)) &&
-	    !ocfs2_mount_local(osb))
+	    !ocfs2_mount_local(osb)) {
+		oh = ocfs2_is_locked_by_me(lockres);
+		if (unlikely(!oh)) {
+		       mlog(ML_ERROR, "PID(%d) unlock lockres(%s) unexpectedly\n",
+			       pid_nr(task_pid(current)), lockres->l_name);
+		       return;
+		}
+		ocfs2_remove_holder(lockres, oh);
+
 		ocfs2_cluster_unlock(OCFS2_SB(inode->i_sb), lockres, level);
+	}
 }
 
 int ocfs2_orphan_scan_lock(struct ocfs2_super *osb, u32 *seqno)
