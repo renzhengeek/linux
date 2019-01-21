@@ -176,15 +176,18 @@ static int discard_map(struct dm_target *ti, struct bio *bio)
 {
 	struct fake_discard *fd = ti->private;
 
-	if (bio->bi_rw & REQ_DISCARD) {
+	if (bio_op(bio) == REQ_OP_DISCARD) {
 		if (fd->supports_discard) {
-			bio_endio(bio, 0);
+			bio->bi_status = 0;
+			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
-		} else
-			bio_endio(bio, -ENOTSUPP);
+		} else {
+			bio->bi_status = BLK_STS_NOTSUPP;
+			bio_endio(bio);
+		}
 	} else {
-		bio->bi_bdev = fd->dev->bdev;
-		bio->bi_sector = dm_target_offset(ti, bio->bi_sector) + fd->offset;
+		bio_set_dev(bio, fd->dev->bdev);
+		bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector) + fd->offset;
 	}
 
 	return DM_MAPIO_REMAPPED;
@@ -210,7 +213,7 @@ static void discard_status(struct dm_target *ti, status_type_t type,
 		break;
 	}
 }
-
+/*
 static int discard_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 			 struct bio_vec *biovec, int max_size)
 {
@@ -225,6 +228,7 @@ static int discard_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 
 	return min(max_size, q->merge_bvec_fn(q, bvm, biovec));
 }
+*/
 
 static int discard_iterate_devices(struct dm_target *ti,
 				   iterate_devices_callout_fn fn, void *data)
@@ -250,7 +254,7 @@ static struct target_type fake_discard_target = {
 	.dtr    = discard_dtr,
 	.map    = discard_map,
 	.status = discard_status,
-	.merge  = discard_merge,
+//	.merge  = discard_merge,
 	.iterate_devices = discard_iterate_devices,
 	.io_hints = discard_io_hints,
 };
