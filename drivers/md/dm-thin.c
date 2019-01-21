@@ -1373,6 +1373,7 @@ static void schedule_external_copy(struct thin_c *tc, dm_block_t virt_block,
 		schedule_zero(tc, virt_block, data_dest, cell, bio);
 }
 
+static void abort_transaction(struct pool *pool);
 static void set_pool_mode(struct pool *pool, enum pool_mode new_mode);
 
 static void requeue_bios(struct pool *pool);
@@ -3746,6 +3747,88 @@ static int process_release_metadata_snap_mesg(unsigned argc, char **argv, struct
 	return r;
 }
 
+/*----------------------------------------------------------------*/
+
+struct set_mode_work {
+       struct pool_work pw;
+       struct pool *pool;
+       enum pool_mode mode;
+       bool abort;
+};
+
+static struct set_mode_work *to_set_mode_work(struct work_struct *ws)
+{
+       return container_of(to_pool_work(ws), struct set_mode_work, pw);
+}
+
+static void do_set_mode_work(struct work_struct *ws)
+{
+       struct set_mode_work *w = to_set_mode_work(ws);
+
+       DMWARN("pool mode being forced via external message");
+
+       if (w->abort)
+               abort_transaction(w->pool);
+
+       set_pool_mode(w->pool, w->mode);
+       pool_work_complete(&w->pw);
+}
+
+static void set_mode_work(struct pool *pool, enum pool_mode mode, bool abort)
+{
+        struct set_mode_work w;
+
+        w.pool = pool;
+        w.mode = mode;
+        w.abort = abort;
+
+        pool_work_wait(&w.pw, pool, do_set_mode_work);
+}
+
+static int process_set_mode_mesg(unsigned argc, char **argv, struct pool *pool)
+{
+	int r;
+	bool abort;
+	enum pool_mode mode;
+
+	r = check_arg_count(argc, 3);
+	if (r)
+		return r;
+
+	if (!strcasecmp(argv[1], "write"))
+		mode = PM_WRITE;
+
+	else if (!strcasecmp(argv[1], "out-of-data-space"))
+		mode = PM_OUT_OF_DATA_SPACE;
+
+	else if (!strcasecmp(argv[1], "read-only"))
+		mode = PM_READ_ONLY;
+
+	else if (!strcasecmp(argv[1], "fail"))
+		mode = PM_FAIL;
+
+	else {
+		DMWARN("set_mode message specified an unkown mode '%s'\n",
+		       argv[1]);
+		return -EINVAL;
+	}
+
+	if (!strcmp(argv[2], "abort"))
+		abort = true;
+
+	else if (!strcmp(argv[2], "no-abort"))
+		abort = false;
+
+	else {
+		DMWARN("set_mode message specified an unknown abort flag '%s'\n",
+		       argv[2]);
+		return -EINVAL;
+	}
+
+	set_mode_work(pool, mode, abort);
+	return 0;
+}
+
 /*
  * Messages supported:
  *   create_thin	<dev_id>
@@ -3754,6 +3837,7 @@ static int process_release_metadata_snap_mesg(unsigned argc, char **argv, struct
  *   set_transaction_id <current_trans_id> <new_trans_id>
  *   reserve_metadata_snap
  *   release_metadata_snap
+ *   set_mode <write|out-of-data-space|read-only|fail> <abort|no-abort>
  */
 static int pool_message(struct dm_target *ti, unsigned argc, char **argv,
 			char *result, unsigned maxlen)
@@ -3785,6 +3869,10 @@ static int pool_message(struct dm_target *ti, unsigned argc, char **argv,
 
 	else if (!strcasecmp(argv[0], "release_metadata_snap"))
 		r = process_release_metadata_snap_mesg(argc, argv, pool);
+
+	else if (!strcasecmp(argv[0], "set_mode"))
+		/* we skip the commit for this one */
+		return process_set_mode_mesg(argc, argv, pool);
 
 	else
 		DMWARN("Unrecognised thin pool target message received: %s", argv[0]);
